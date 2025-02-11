@@ -1,0 +1,101 @@
+---
+- name: Install AD and DNS on Windows Server 2022
+  hosts: domain_controllers
+  gather_facts: yes
+  tasks:
+    - name: Allow necessary firewall ports
+      win_firewall_rule:
+        name: "{{ item.name }}"
+        enable: yes
+        direction: in
+        localport: "{{ item.localport }}"
+        protocol: "{{ item.protocol }}"
+        action: allow
+      loop:
+        - { name: "Allow DNS TCP", localport: 53, protocol: "TCP" }
+        - { name: "Allow DNS UDP", localport: 53, protocol: "UDP" }
+        - { name: "Allow Kerberos TCP", localport: 88, protocol: "TCP" }
+        - { name: "Allow Kerberos UDP", localport: 88, protocol: "UDP" }
+        - { name: "Allow LDAP TCP", localport: 389, protocol: "TCP" }
+        - { name: "Allow LDAP UDP", localport: 389, protocol: "UDP" }
+        - { name: "Allow SMB TCP", localport: 445, protocol: "TCP" }
+        - { name: "Allow RPC TCP", localport: 135, protocol: "TCP" }
+        - { name: "Allow Global Catalog TCP", localport: 3268, protocol: "TCP" }
+        - { name: "Allow LDAPS TCP", localport: 636, protocol: "TCP" }
+
+    - name: Set Windows hostname
+      ansible.windows.win_hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Reboot the server if a name change is pending
+      ansible.windows.win_reboot:
+        reboot_timeout: 120
+        test_command: whoami
+      when: ansible_facts['hostname'] != inventory_hostname
+
+    - name: Install Active Directory Domain Services (if not already installed)
+      ansible.windows.win_feature:
+        name: AD-Domain-Services
+        state: present
+
+    - name: Install RSAT AD Tools
+      ansible.windows.win_feature:
+        name: RSAT-AD-Tools
+        state: present
+
+    - name: Get DC01 IP address from inventory
+      set_fact:
+        dc01_ip: "{{ hostvars['DC01'].ansible_host }}"
+
+    - name: Get DC02 IP address from inventory
+      set_fact:
+        dc02_ip: "{{ hostvars['DC02'].ansible_host }}"
+
+    - name: Add DC01 and DC02 to hosts file
+      community.windows.win_lineinfile:
+        path: C:\Windows\System32\drivers\etc\hosts
+        line: "{{ item }}"
+        create: yes
+      loop:
+        - "{{ dc01_ip }} DC01"
+        - "{{ dc02_ip }} DC02"
+
+    - name: Set DNS server to DC01 IP on DC02
+      ansible.windows.win_dns_client:
+        interface_index: 12
+        dns_servers:
+          - "{{ dc01_ip if inventory_hostname == 'DC02' else dc02_ip }}"
+
+    - name: Install Active Directory Forest (Primary AD on DC01)
+      microsoft.ad.domain:
+        create_dns_delegation: false
+        dns_domain_name: "icinfra.cn"
+        domain_netbios_name: "ICINFRA"
+        install_dns: true
+        safe_mode_password: "123456"
+        reboot: yes
+        reboot_timeout: 900
+      when: inventory_hostname == "DC01"
+
+    - name: Join the domain on DC02
+      microsoft.ad.membership:
+        dns_domain_name: icinfra.cn
+        domain_admin_user: "icinfra\\Administrator"
+        domain_admin_password: "123456"
+        state: domain
+        reboot: yes
+      when: inventory_hostname == "DC02"
+
+    - name: Promote DC02 to Domain Controller (Replica)
+      microsoft.ad.domain_controller:
+        dns_domain_name: "icinfra.cn"
+        domain_admin_user: "icinfra\\Administrator"
+        domain_admin_password: "123456"
+        safe_mode_password: "123456"
+        sysvol_path: "C:\\Windows\\SYSVOL"
+        database_path: "C:\\Windows\\NTDS"
+        install_dns: true
+        state: "domain_controller"
+        reboot: yes
+        reboot_timeout: 900
+      when: inventory_hostname == "DC02"
